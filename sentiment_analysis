@@ -1,0 +1,486 @@
+import json
+import nltk
+import os
+import random
+import re
+import torch
+import numpy as np
+
+from torch import nn, optim
+import torch.nn.functional as F
+
+
+with open(os.path.join('..', '..', 'data', 'project_6_stocktwits', 'twits.json'), 'r') as f:
+    twits = json.load(f)
+
+print(twits['data'][:10])
+
+
+"""print out the number of twits"""
+print('Number of twits in dataset is: {:,.0f}'.format(len(twits['data'])))
+
+
+
+messages = [twit['message_body'] for twit in twits['data']]
+# Since the sentiment scores are discrete, we'll scale the sentiments to 0 to 4 for use in our network
+sentiments = [twit['sentiment'] + 2 for twit in twits['data']]
+
+
+
+nltk.download('wordnet')
+
+
+def preprocess(message):
+    """
+    This function takes a string as input, then performs these operations: 
+        - lowercase
+        - remove URLs
+        - remove ticker symbols 
+        - removes punctuation
+        - tokenize by splitting the string on whitespace 
+        - removes any single character tokens
+    
+    Parameters
+    ----------
+        message : The text message to be preprocessed.
+        
+    Returns
+    -------
+        tokens: The preprocessed text into tokens.
+    """ 
+   
+    # Lowercase the twit message
+    text = message.lower()
+    
+    # Replace URLs with a space in the message
+    text = re.sub(r'https?://\S+', ' ', text) 
+    
+    # Replace ticker symbols with a space. The ticker symbols are any stock symbol that starts with $.
+    text = re.sub(r'\$\S+', ' ', text)
+    
+    # Replace StockTwits usernames with a space. The usernames are any word that starts with @.
+    text = re.sub(r'\@\S+', ' ', text)
+
+    # Replace everything not a letter with a space
+    text = re.sub(r'[^a-zA-z]', ' ', text)
+    
+    # Tokenize by splitting the string on whitespace into a list of words
+    tokens = text.split()
+
+    # Lemmatize words using the WordNetLemmatizer. You can ignore any word that is not longer than one character.
+    wnl = nltk.stem.WordNetLemmatizer()
+    tokens = [wnl.lemmatize(word, pos='v') for word in tokens if len(word) > 1]
+    
+    return tokens
+
+
+# test implementation on 3 messages
+for twit in twits['data'][0:3]:
+    print(twit['message_body'])
+    print(preprocess(twit['message_body']))
+    print('\n')
+
+
+# use preprocess function defined above to create a new list of tokenized messages
+tokenized = [preprocess(twit) for twit in messages]
+
+
+# test results
+print('Pre-processing: ', messages[0:3])
+print('\n')
+print('Post-processing: ', tokenized[0:3])
+
+
+from collections import Counter
+"""
+Create a vocabulary by using Bag of words
+"""
+
+# changed implementation here for advice on student hub
+bow = Counter()
+
+for message in tokenized:
+    bow.update(message)
+
+# review results
+bow
+
+
+"""
+Set the following variables:
+    freqs
+    low_cutoff
+    high_cutoff
+    K_most_common
+"""
+
+# TODO Implement 
+
+# Dictionary that contains the Frequency of words appearing in messages.
+# The key is the token and the value is the frequency of that word in the corpus.
+# store the number of messages
+n_twits = len(tokenized)
+
+freqs = {key: bow[key]/n_twits for key in sorted(bow, key = bow.get, reverse=True)}
+
+# Float that is the frequency cutoff. Drop words with a frequency that is lower or equal to this number.
+low_cutoff = 0.000002
+
+# Integer that is the cut off for most common words. Drop words that are the `high_cutoff` most common words.
+high_cutoff = 11
+
+# The k most common words in the corpus. Use `high_cutoff` as the k.
+K_most_common = list(freqs.keys())[0:high_cutoff]
+
+
+filtered_words = [word for word in freqs if (freqs[word] > low_cutoff and word not in K_most_common)]
+print(K_most_common)
+len(filtered_words) 
+
+
+
+# test filtered words in order.
+print('First word in filtered words list is: ', filtered_words[0])
+print(bow.most_common(high_cutoff+1)[-1])
+
+
+"""
+Set the following variables:
+    vocab
+    id2vocab
+    filtered
+"""
+# A dictionary for the `filtered_words`. The key is the word and value is an id that represents the word. 
+# started at 1 since 0 is used for padding
+vocab = {word:idx for idx, word in enumerate(filtered_words, 1)}
+# Reverse of the `vocab` dictionary. The key is word id and value is the word. 
+id2vocab = {idx:word for word, idx in vocab.items()}
+# tokenized with the words not in `filtered_words` removed.
+filtered = []
+for token in tokenized:
+    filtered.append([word for word in token if word in vocab])
+    
+# review results
+print(filtered[:5])
+
+
+
+balanced = {'messages': [], 'sentiments':[]}
+
+n_neutral = sum(1 for each in sentiments if each == 2)
+N_examples = len(sentiments)
+keep_prob = (N_examples - n_neutral)/4/n_neutral
+
+for idx, sentiment in enumerate(sentiments):
+    message = filtered[idx]
+    if len(message) == 0:
+        # skip this message because it has length zero
+        continue
+    elif sentiment != 2 or random.random() < keep_prob:
+        balanced['messages'].append(message)
+        balanced['sentiments'].append(sentiment) 
+        
+        
+n_neutral = sum(1 for each in balanced['sentiments'] if each == 2)
+N_examples = len(balanced['sentiments'])
+n_neutral/N_examples
+
+
+token_ids = [[vocab[word] for word in message] for message in balanced['messages']]
+sentiments = balanced['sentiments']
+
+
+
+
+class TextClassifier(nn.Module):
+    def __init__(self, vocab_size, embed_size, lstm_size, output_size, lstm_layers=1, dropout=0.1):
+        """
+        Initialize the model by setting up the layers.
+        
+        Parameters
+        ----------
+            vocab_size : The vocabulary size.
+            embed_size : The embedding layer size.
+            lstm_size : The LSTM layer size.
+            output_size : The output size.
+            lstm_layers : The number of LSTM layers.
+            dropout : The dropout probability.
+        """
+        
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.embed_size = embed_size
+        self.lstm_size = lstm_size
+        self.output_size = output_size
+        self.lstm_layers = lstm_layers
+        self.dropout = dropout
+        
+        # Setup embedding layer
+        self.embedding = nn.Embedding(vocab_size, embed_size)
+        
+        # Setup additional layers
+        # add lstm layer
+        self.lstm = nn.LSTM(embed_size, lstm_size, lstm_layers, 
+                            dropout=dropout, batch_first = False)
+        
+        # add dropout layer
+        self.dropout = nn.Dropout(dropout)
+        
+        # add fully connected layer
+        self.fc = nn.Linear(lstm_size, output_size)
+        
+        # add log softmax outpout layer
+        self.logsoftmax = nn.LogSoftmax(dim=1)
+
+
+    def init_hidden(self, batch_size):
+        """ 
+        Initializes hidden state
+        
+        Parameters
+        ----------
+            batch_size : The size of batches.
+        
+        Returns
+        -------
+            hidden_state
+            
+        """
+        
+        # Create two new tensors with sizes n_layers x batch_size x hidden_dim,
+        # initialized to zero, for hidden state and cell state of LSTM       
+        weight = next(self.parameters()).data
+        
+        hidden_state = (weight.new(self.lstm_layers, batch_size, self.lstm_size).zero_(),
+                        weight.new(self.lstm_layers, batch_size, self.lstm_size).zero_())
+        
+        # return initialized hidden state
+        return hidden_state
+
+
+    def forward(self, nn_input, hidden_state):
+        """
+        Perform a forward pass of our model on nn_input.
+        
+        Parameters
+        ----------
+            nn_input : The batch of input to the NN.
+            hidden_state : The LSTM hidden state.
+
+        Returns
+        -------
+            logps: log softmax output
+            hidden_state: The new hidden state.
+
+        """
+        
+        # conduct forward pass usigng layers defined above
+        batch_size = nn_input.size(-1)
+        
+        # embedding layer
+        embedded = self.embedding(nn_input)
+        
+        # pass to the lstm layers and stack outouts
+        lstm_out, hidden = self.lstm(embedded, hidden_state)
+        
+        lstm_out = lstm_out.contiguous().view(-1, self.lstm_size)
+        
+        # forward pass through dropout and fully connected dense layer
+        lstm_out = self.dropout(lstm_out)
+        
+        output = self.fc(lstm_out)
+        
+        # logsoftmax layer
+        logps = self.logsoftmax(output)
+        
+        # reshape so batch size is first
+        logps = logps.view(batch_size, -1)
+        
+        return logps, hidden
+        
+
+
+model = TextClassifier(len(vocab), 10, 6, 5, dropout=0.1, lstm_layers=2)
+model.embedding.weight.data.uniform_(-1, 1)
+input = torch.randint(0, 1000, (5, 4), dtype=torch.int64)
+hidden = model.init_hidden(4)
+
+logps, _ = model.forward(input, hidden)
+print(logps)
+
+
+
+def dataloader(messages, labels, sequence_length=30, batch_size=32, shuffle=False):
+    """ 
+    Build a dataloader.
+    """
+    if shuffle:
+        indices = list(range(len(messages)))
+        random.shuffle(indices)
+        messages = [messages[idx] for idx in indices]
+        labels = [labels[idx] for idx in indices]
+
+    total_sequences = len(messages)
+
+    for ii in range(0, total_sequences, batch_size):
+        batch_messages = messages[ii: ii+batch_size]
+        
+        # First initialize a tensor of all zeros
+        batch = torch.zeros((sequence_length, len(batch_messages)), dtype=torch.int64)
+        for batch_num, tokens in enumerate(batch_messages):
+            token_tensor = torch.tensor(tokens)
+            # Left pad!
+            start_idx = max(sequence_length - len(token_tensor), 0)
+            batch[start_idx:, batch_num] = token_tensor[:sequence_length]
+        
+        label_tensor = torch.tensor(labels[ii: ii+len(batch_messages)])
+        
+        yield batch, label_tensor
+        
+        
+        
+"""
+Split data into training and validation datasets. Use an appropriate split size.
+The features are the `token_ids` and the labels are the `sentiments`.
+"""   
+# calculate an index to split on
+split_idx = int(0.8 * len(token_ids))
+
+train_features, valid_features = token_ids[:split_idx], token_ids[split_idx:]
+train_labels, valid_labels = sentiments[:split_idx], sentiments[split_idx:]
+
+# confirm shapes
+print('\t\t\tTrain\t\tValidation')
+print('\nFeatures shape:\t\t{:,.0f}\t\t{:,.0f}'.format(len(train_features),
+                                             len(valid_features)))
+
+print('Labels shape:\t\t{:,.0f}\t\t{:,.0f}'.format(len(train_labels),
+                                           len(valid_labels)))
+                                           
+                                           
+                                           
+text_batch, labels = next(iter(dataloader(train_features, train_labels, sequence_length=20, batch_size=64)))
+model = TextClassifier(len(vocab)+1, 200, 128, 5, dropout=0.)
+hidden = model.init_hidden(64)
+logps, hidden = model.forward(text_batch, hidden)
+
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+model = TextClassifier(len(vocab)+1, 1024, 512, 5, lstm_layers=2, dropout=0.2)
+model.embedding.weight.data.uniform_(-1, 1)
+model.to(device)
+
+
+
+"""
+Train your model with dropout. Make sure to clip your gradients.
+Print the training loss, validation loss, and validation accuracy for every 100 steps.
+"""
+
+epochs = 5
+batch_size = 512
+learning_rate = 0.003
+
+print_every = 100
+criterion = nn.NLLLoss()
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+model.train()
+
+for epoch in range(epochs):
+    print('\n\nStarting epoch {} of {} epochs:'.format(epoch + 1, epochs))
+    
+    # initialize the hidden state
+    #hidden = model.init_hidden(labels.shape[0])
+    
+    steps = 0
+    for text_batch, labels in dataloader(
+            train_features, train_labels, batch_size=batch_size, sequence_length=20, shuffle=True):
+        
+        # keep track of steps for reporting/validation
+        steps += 1
+        
+        # set inputs to device
+        text_batch, labels = text_batch.to(device), labels.to(device)
+
+        # initialize the hidden state before loop
+        hidden = model.init_hidden(labels.shape[0])
+
+        hidden = tuple([each.data for each in hidden])
+
+        for each in hidden:
+            each.to(device)
+        
+        # set gradients to zero
+        model.zero_grad()
+        
+        
+        # pass inputs into model and get output/hidden state back
+        logps, hidden  = model(text_batch, hidden)
+        
+        
+        # calculate the loss and perform backpropagation
+        loss = criterion(logps.squeeze(), labels)
+        loss.backward()
+        
+        # clip the gradients
+        nn.utils.clip_grad_norm_(model.parameters(), 5)
+        
+        # take step
+        optimizer.step()
+        
+
+        if steps % print_every == 0:
+            model.eval()
+            
+            # initialize the hidden state
+            #val_h = model.init_hidden(labels.shape[0])
+            
+            # reset accuracy and validation loss
+            accuracy = 0
+            validation_losses = []
+            
+            
+            # check model performance on validation set
+            for text_batch, labels in dataloader(valid_features, valid_labels, 
+                                                 batch_size=batch_size, 
+                                                 sequence_length=20, 
+                                                 shuffle=True):
+
+                
+                # initialize hidden state for validation pass
+                val_h = model.init_hidden(labels.shape[0])
+                for each in val_h:
+                    each.to(device)
+
+        
+                # transfer inputs to appropriate device
+                text_batch, labels = text_batch.to(device), labels.to(device)
+                
+                logps, val_h = model(text_batch, val_h)
+                
+                # record loss
+                validation_loss = criterion(logps.squeeze(), labels)
+                validation_losses.append(validation_loss.item())
+                
+                
+                # since logsoftmax, take exponential to get probabilities
+                probs = torch.exp(logps)
+                
+                
+                # compare highest probability prediction to labels
+                top_ps, top_k = probs.topk(k=1, dim=1)
+                
+                equals = top_k == labels.view(*top_k.shape)
+                
+                # take mean to update the accuracy
+                accuracy += torch.mean(equals.type(torch.FloatTensor))
+                
+            
+            # Print metrics
+            print('\tTraining Loss: {:.4f}\t'.format(loss.item()),
+                  '\tValidation Loss: {:.4f}\t'.format(sum(validation_losses)/len(validation_losses)),
+                  '\tValidation Accuracy: {:.4f}'.format(accuracy/len(validation_losses))) 
+            
+            model.train()
